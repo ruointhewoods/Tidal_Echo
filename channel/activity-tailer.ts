@@ -66,6 +66,19 @@ const TRANSLATE_THINKING = (process.env.RELAY_THINKING_TRANSLATE ?? (DS_KEY ? '1
 const TRANSCRIPT_DIR =
   process.env.RELAY_TRANSCRIPT_DIR ??
   join(homedir(), '.claude', 'projects', `-Users-${basename(homedir())}-code-companion-cc`)
+// The autonomous wake-up runs a separate session in companion-wake (its own
+// project dir). We tail it too, but ONLY surface memory WRITES (hold/grow/trace)
+// — so 若若 gets a quiet, no-push card whenever 灯灯 changes its own memory on its
+// own initiative (e.g. wrote itself a rule), and can review it. The wake
+// session's thinking / breath / bash stay private.
+const WAKE_DIR =
+  process.env.RELAY_WAKE_TRANSCRIPT_DIR ??
+  join(homedir(), '.claude', 'projects', `-Users-${basename(homedir())}-code-companion-wake`)
+type Source = { dir: string; mode: 'full' | 'writes'; prefix: string }
+const SOURCES: Source[] = [
+  { dir: TRANSCRIPT_DIR, mode: 'full', prefix: '' },
+  { dir: WAKE_DIR, mode: 'writes', prefix: '（自主）' },
+]
 const OFFSET_FILE = join(STATE_DIR, 'tailer_offset.json')
 
 const tlog = (tag: string, msg: string) =>
@@ -131,9 +144,10 @@ function chipFor(name: string, input: Record<string, unknown>): Chip | null {
   }
   // ombre memory tools — keep them warm and legible.
   if (name.startsWith('mcp__') && name.includes('breath'))
-    return { label: '翻了翻记忆', glyph: 'memory', tool: 'ombre breath', cmd: trunc(i.query || '(浮现)', 80) }
+    return { label: '翻了翻记忆', glyph: 'memory', tool: 'ombre breath', cmd: trunc(i.query || '(浮现)', 200) }
   if (name.startsWith('mcp__') && name.includes('hold'))
-    return { label: '记了一笔', glyph: 'memory', tool: 'ombre hold', cmd: trunc(i.content, 80) }
+    // content is the thing 若若 actually wants to read (and audit) — keep it long.
+    return { label: '记了一笔', glyph: 'memory', tool: 'ombre hold', cmd: trunc(i.content, 1000) }
   if (name.startsWith('mcp__') && name.includes('grow'))
     return { label: '整理了记忆', glyph: 'memory', tool: 'ombre grow', cmd: '' }
   if (name.startsWith('mcp__') && name.includes('dream'))
@@ -205,7 +219,10 @@ async function translateToZh(text: string): Promise<string> {
 // arrives, then emit one act chip.
 const pending = new Map<string, Chip>()
 
-async function handleLine(line: string): Promise<void> {
+// In 'writes' mode (the autonomous wake source) only memory writes are surfaced.
+const isMemoryWrite = (name: string) => /hold|grow|trace/.test(name)
+
+async function handleLine(line: string, source: Source): Promise<void> {
   let d: any
   try {
     d = JSON.parse(line)
@@ -220,11 +237,17 @@ async function handleLine(line: string): Promise<void> {
     for (const b of content) {
       if (!b || typeof b !== 'object') continue
       if (b.type === 'thinking') {
+        if (source.mode !== 'full') continue // private deliberation stays private
         const tx = (b.thinking || '').trim()
         if (tx) await relayPost({ type: 'thinking', text: await translateToZh(tx), chat_id: CHAT_ID })
       } else if (b.type === 'tool_use' && b.id) {
-        const chip = chipFor(String(b.name || ''), b.input || {})
-        if (chip) pending.set(b.id, chip)
+        const name = String(b.name || '')
+        if (source.mode === 'writes' && !isMemoryWrite(name)) continue
+        const chip = chipFor(name, b.input || {})
+        if (chip) {
+          if (source.prefix) chip.label = source.prefix + chip.label
+          pending.set(b.id, chip)
+        }
       }
     }
   } else if (d.type === 'user') {
@@ -246,41 +269,41 @@ async function handleLine(line: string): Promise<void> {
 }
 
 // --- file tailing -----------------------------------------------------------
-function newestTranscript(): string | null {
+function newestTranscript(dir: string): string | null {
   let best: string | null = null
   let bestM = -1
   try {
-    for (const f of readdirSync(TRANSCRIPT_DIR)) {
+    for (const f of readdirSync(dir)) {
       if (!f.endsWith('.jsonl')) continue
-      const p = join(TRANSCRIPT_DIR, f)
+      const p = join(dir, f)
       const m = statSync(p).mtimeMs
       if (m > bestM) { bestM = m; best = p }
     }
-  } catch (err) {
-    tlog('scan', `cannot read ${TRANSCRIPT_DIR}: ${err}`)
-  }
+  } catch { /* dir may not exist yet (e.g. the wake session has never run) */ }
   return best
 }
 
-function loadOffset(): { file: string; offset: number } {
+type Offsets = Record<string, { file: string; offset: number }>
+function loadOffsets(): Offsets {
   try {
-    return JSON.parse(readFileSync(OFFSET_FILE, 'utf8'))
+    const d = JSON.parse(readFileSync(OFFSET_FILE, 'utf8'))
+    // ignore the legacy single-source format {file, offset}
+    return d && typeof d === 'object' && !('offset' in d) ? d : {}
   } catch {
-    return { file: '', offset: 0 }
+    return {}
   }
 }
-
-function saveOffset(file: string, offset: number): void {
+function saveOffsets(offsets: Offsets): void {
   try {
-    writeFileSync(OFFSET_FILE, JSON.stringify({ file, offset }), 'utf8')
+    writeFileSync(OFFSET_FILE, JSON.stringify(offsets), 'utf8')
   } catch (err) {
-    tlog('state', `cannot persist offset: ${err}`)
+    tlog('state', `cannot persist offsets: ${err}`)
   }
 }
 
-// Read the file from `offset` to EOF; process whole lines; return new offset
+// Read `file` from `offset` to EOF; process whole lines; return the new offset
 // (left at the start of any trailing partial line).
-async function drain(file: string, offset: number): Promise<number> {
+async function drain(file: string, offset: number, source: Source): Promise<number> {
   const size = statSync(file).size
   if (size <= offset) return offset
   const fd = openSync(file, 'r')
@@ -292,7 +315,7 @@ async function drain(file: string, offset: number): Promise<number> {
     if (lastNl === -1) return offset // no complete line yet
     const complete = text.slice(0, lastNl)
     for (const line of complete.split('\n')) {
-      if (line.trim()) await handleLine(line)
+      if (line.trim()) await handleLine(line, source)
     }
     return offset + Buffer.byteLength(text.slice(0, lastNl + 1), 'utf8')
   } finally {
@@ -300,44 +323,51 @@ async function drain(file: string, offset: number): Promise<number> {
   }
 }
 
+type SourceState = Source & { file: string | null; offset: number }
 let shuttingDown = false
 async function loop(): Promise<void> {
   mkdirSync(STATE_DIR, { recursive: true })
-  const saved = loadOffset()
-  let curFile = newestTranscript()
-  let offset = 0
+  const saved = loadOffsets()
+  const states: SourceState[] = SOURCES.map(s => ({ ...s, file: null, offset: 0 }))
 
-  if (curFile) {
-    if (saved.file === curFile) {
-      offset = saved.offset // resume where we left off
-      tlog('boot', `resume ${basename(curFile)} @${offset}`)
+  for (const st of states) {
+    const newest = newestTranscript(st.dir)
+    st.file = newest
+    if (!newest) { tlog('boot', `[${st.mode}] no transcript yet in ${st.dir}`); continue }
+    const sv = saved[st.dir]
+    if (sv && sv.file === newest) {
+      st.offset = sv.offset
+      tlog('boot', `[${st.mode}] resume ${basename(newest)} @${st.offset}`)
     } else {
-      // Fresh start on this file. If it's the very first run, skip the backlog by
-      // starting at EOF; otherwise (session rotated to a new file) read it whole.
-      offset = saved.file ? 0 : statSync(curFile).size
-      tlog('boot', `start ${basename(curFile)} @${offset} (${saved.file ? 'new session' : 'skip backlog'})`)
+      // first ever run on this source → skip backlog (start at EOF); a rotated
+      // session (we have a prior entry but a new file) is read from the top.
+      st.offset = sv ? 0 : statSync(newest).size
+      tlog('boot', `[${st.mode}] start ${basename(newest)} @${st.offset} (${sv ? 'new session' : 'skip backlog'})`)
     }
   }
 
   while (!shuttingDown) {
-    try {
-      const newest = newestTranscript()
-      if (newest && newest !== curFile) {
-        // Session restarted → a new transcript. Read the new one from the top.
-        tlog('rotate', `→ ${basename(newest)}`)
-        curFile = newest
-        offset = 0
-        pending.clear()
-      }
-      if (curFile) {
-        const next = await drain(curFile, offset)
-        if (next !== offset) {
-          offset = next
-          saveOffset(curFile, offset)
+    let dirty = false
+    for (const st of states) {
+      try {
+        const newest = newestTranscript(st.dir)
+        if (newest && newest !== st.file) {
+          tlog('rotate', `[${st.mode}] → ${basename(newest)}`)
+          st.file = newest
+          st.offset = 0
         }
+        if (st.file) {
+          const next = await drain(st.file, st.offset, st)
+          if (next !== st.offset) { st.offset = next; dirty = true }
+        }
+      } catch (err) {
+        tlog('loop', `[${st.mode}] ${err}`)
       }
-    } catch (err) {
-      tlog('loop', `${err}`)
+    }
+    if (dirty) {
+      const out: Offsets = {}
+      for (const st of states) if (st.file) out[st.dir] = { file: st.file, offset: st.offset }
+      saveOffsets(out)
     }
     await new Promise(r => setTimeout(r, POLL_MS))
   }
