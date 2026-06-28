@@ -58,6 +58,11 @@ const RELAY = (process.env.RELAY_URL ?? '').replace(/\/+$/, '')
 const SECRET = process.env.RELAY_SECRET ?? ''
 const CHAT_ID = process.env.RELAY_CHAT_ID ?? 'me'
 const POLL_MS = Number(process.env.RELAY_TAILER_POLL_MS ?? 1500)
+// thinking summaries come back from the API in English; translate them to Chinese
+// via DeepSeek (cheap, strong zh) before forwarding. On by default when a key is
+// present; falls back to the original English on any failure.
+const DS_KEY = process.env.DEEPSEEK_API_KEY ?? ''
+const TRANSLATE_THINKING = (process.env.RELAY_THINKING_TRANSLATE ?? (DS_KEY ? '1' : '0')) !== '0'
 const TRANSCRIPT_DIR =
   process.env.RELAY_TRANSCRIPT_DIR ??
   join(homedir(), '.claude', 'projects', `-Users-${basename(homedir())}-code-companion-cc`)
@@ -109,7 +114,7 @@ function chipFor(name: string, input: Record<string, unknown>): Chip | null {
   const i = input || {}
   switch (name) {
     case 'Bash':
-      return { label: '跑了个命令', glyph: 'terminal', tool: 'Bash', cmd: trunc(i.command, 120) }
+      return { label: '跑了个命令', glyph: 'terminal', tool: 'Bash', cmd: trunc(i.command, 200) }
     case 'Read':
       return { label: '看了看文件', glyph: 'memory', tool: 'Read', cmd: trunc(basename(String(i.file_path ?? '')), 80) }
     case 'Edit':
@@ -120,7 +125,7 @@ function chipFor(name: string, input: Record<string, unknown>): Chip | null {
     case 'Glob':
       return { label: '找了找文件', glyph: 'search', tool: 'Glob', cmd: trunc(i.pattern, 80) }
     case 'WebFetch':
-      return { label: '查了下网页', glyph: 'fetch', tool: 'WebFetch', cmd: trunc(i.url ?? i.prompt, 100) }
+      return { label: '查了下网页', glyph: 'fetch', tool: 'WebFetch', cmd: trunc(i.url ?? i.prompt, 200) }
     case 'WebSearch':
       return { label: '搜了下', glyph: 'search', tool: 'WebSearch', cmd: trunc(i.query, 80) }
   }
@@ -146,15 +151,52 @@ function chipFor(name: string, input: Record<string, unknown>): Chip | null {
 // Pull readable text out of a tool_result content block (string | array of parts).
 function resultText(block: any): string {
   const c = block?.content
-  if (typeof c === 'string') return trunc(c, 140)
+  if (typeof c === 'string') return trunc(c, 1200)
   if (Array.isArray(c)) {
     const txt = c
       .map((p: any) => (typeof p === 'string' ? p : p && p.type === 'text' ? p.text : ''))
       .filter(Boolean)
       .join(' ')
-    return trunc(txt, 140)
+    return trunc(txt, 1200)
   }
   return ''
+}
+
+// Translate an English thinking summary to Chinese via DeepSeek. Skips when
+// disabled, when no key, or when the text already contains Chinese. Always
+// returns *something* — falls back to the original text on any error/timeout.
+const HAS_CJK = /[一-鿿]/
+async function translateToZh(text: string): Promise<string> {
+  if (!TRANSLATE_THINKING || !DS_KEY || !text || HAS_CJK.test(text)) return text
+  try {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 8000)
+    const res = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${DS_KEY}` },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        temperature: 0.3,
+        stream: false,
+        messages: [
+          { role: 'system', content: '你是翻译器。把用户给的英文翻译成自然、口语化的简体中文，第一人称口吻，只输出译文，不要解释、不要加引号。' },
+          { role: 'user', content: text },
+        ],
+      }),
+      signal: ctrl.signal,
+    })
+    clearTimeout(timer)
+    if (!res.ok) {
+      tlog('tr', `deepseek HTTP ${res.status}`)
+      return text
+    }
+    const data: any = await res.json()
+    const out = data?.choices?.[0]?.message?.content
+    return typeof out === 'string' && out.trim() ? out.trim() : text
+  } catch (err) {
+    tlog('tr', `translate failed: ${err}`)
+    return text
+  }
 }
 
 // --- transcript parsing -----------------------------------------------------
@@ -179,7 +221,7 @@ async function handleLine(line: string): Promise<void> {
       if (!b || typeof b !== 'object') continue
       if (b.type === 'thinking') {
         const tx = (b.thinking || '').trim()
-        if (tx) await relayPost({ type: 'thinking', text: tx, chat_id: CHAT_ID })
+        if (tx) await relayPost({ type: 'thinking', text: await translateToZh(tx), chat_id: CHAT_ID })
       } else if (b.type === 'tool_use' && b.id) {
         const chip = chipFor(String(b.name || ''), b.input || {})
         if (chip) pending.set(b.id, chip)
