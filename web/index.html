@@ -4732,8 +4732,13 @@ inputEl.addEventListener("input", () => {
   sendBtn.classList.remove("hidden");
   micBtn.classList.add("hidden");
 });
+// 触屏(手机)没有 Shift 键,回车键被设成发送时就没法换行。所以:
+//   桌面(精确指针): Enter 发送, Shift+Enter 换行 (保持原样)
+//   手机(粗指针):   Enter 换行 (默认行为), 发送走纸飞机按钮; 软键盘回车键提示改为"换行"
+const coarsePointer = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+if (coarsePointer) inputEl.setAttribute("enterkeyhint", "enter");
 inputEl.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey && !composing){
+  if (e.key === "Enter" && !e.shiftKey && !composing && !coarsePointer){
     e.preventDefault();
     doSend();
   }

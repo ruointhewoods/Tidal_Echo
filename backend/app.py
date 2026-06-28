@@ -533,8 +533,11 @@ async def channel_out(request: Request):
     text = body.get("text", "")
     meta = {k: v for k, v in body.items() if k not in ("type", "text")}
     msg = save_message("out", kind, text, meta)
-    # the AI replied — clear the typing state
-    await broadcast(app_subs, {"type": "typing", "active": False})
+    # the AI replied — clear the typing state. 'thinking'/'act' are mid-turn
+    # activity surfaced by the tailer (the AI is still working toward a reply), so
+    # they must NOT clear typing — only a real reply/call does.
+    if kind not in ("thinking", "act"):
+        await broadcast(app_subs, {"type": "typing", "active": False})
     await broadcast(app_subs, app_payload(msg))
     # Unread push: only when no PWA tab is holding the stream (app_subs empty);
     # only push real replies, not 'thinking' chatter.
